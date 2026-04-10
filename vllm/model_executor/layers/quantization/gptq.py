@@ -12,6 +12,22 @@ from torch.nn.parameter import Parameter
 
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
+
+# XPU kernels aren't auto-loaded; load them once here so torch.ops._xpu_C
+# has int4_gemm_w4a16 and friends registered.
+if current_platform.is_xpu():
+    import os as _os
+    _XPU_SO = _os.path.join(
+        _os.path.dirname(__import__("vllm_xpu_kernels").__file__),
+        "_xpu_C.abi3.so",
+    )
+    if _os.path.exists(_XPU_SO):
+        try:
+            torch.ops.load_library(_XPU_SO)
+        except Exception:
+            pass
+
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.layers.quantization.base_config import (
@@ -355,6 +371,26 @@ class GPTQLinearMethod(LinearMethodBase):
         layer.g_idx = Parameter(layer.g_idx.data, requires_grad=False)
         layer.scales = Parameter(layer.scales.data, requires_grad=False)
 
+        # XPU branch restored from v0.17 (regression fix for v0.19)
+        if current_platform.is_xpu():
+            from vllm_xpu_kernels.quantization._quantize_convert import (
+                GPTQUtils,
+                transpose_onednn_woq_format,
+            )
+
+            if self.quant_config.desc_act and layer.g_idx is not None:
+                gptq_utils = GPTQUtils(
+                    bits=4, blocksize=self.quant_config.group_size
+                )
+                qweight_new, g_idx_new = gptq_utils.shuffle(
+                    layer.qweight, layer.g_idx
+                )
+                layer.qweight.data.copy_(qweight_new)
+                layer.g_idx.data.copy_(g_idx_new)
+                del qweight_new, g_idx_new
+            transpose_onednn_woq_format(layer, "gptq", True)
+            return
+
         # exllama needs to shuffle the weight after the weight is loaded
         # here we do the shuffle on first forward pass
         if layer.exllama_state == ExllamaState.UNINITIALIZED:
@@ -373,6 +409,20 @@ class GPTQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # XPU branch restored from v0.17 (regression fix for v0.19)
+        if current_platform.is_xpu():
+            reshaped_x = x.reshape(-1, x.shape[-1])
+            out = torch.ops._xpu_C.int4_gemm_w4a16(
+                reshaped_x,
+                layer.qweight,
+                bias,
+                layer.scales,
+                layer.qzeros,
+                self.quant_config.group_size,
+                None,
+            )
+            return out.reshape(x.shape[:-1] + (layer.qweight.shape[-1],))
+
         out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
         reshaped_x = x.reshape(-1, x.shape[-1])
 
